@@ -1,0 +1,130 @@
+ # Updated Custom Program C8: Zigzag OD + Media Shift + Growth Rate Logging
+
+    elif program == "C8":
+        try:
+            # --- CSV: first row = headers, second row = values ---
+            with open(f'InputParameters_{M}.csv', 'r') as f:
+                reader = csv.reader(f)
+                header = next(reader)
+                values = next(reader)
+            params = dict(zip([h.strip().lower() for h in header], [v.strip() for v in values]))
+    
+            # --- Parameters (headers in CSV) ---
+            # required
+            ratio = float(params['media_ratio_start'])             # starting fraction from Pump1 (0..1)
+            step = float(params['ratio_step'])                     # increment to ratio after each dilution phase (>=0)
+            output_multiplier = float(params['output_multiplier']) # scales Pump2 vs inputs during dilution
+            od_max = float(params['od_max'])                       # threshold to ENTER dilution
+            od_min = float(params['od_min'])                       # threshold to EXIT dilution
+            # optional
+            interval = int(params.get('dilution_interval', 1))     # min dwell (on/off) in cycles
+            max_input_rate = float(params.get('max_input_rate', 0.02))  # total input cap for Pump1+Pump3
+    
+            # --- Initialize persistent values (C7-style keys) ---
+            if 'ratio_tracker' not in sysData[M]['Custom']:
+                sysData[M]['Custom']['ratio_tracker'] = ratio
+            if 'last_state_change' not in sysData[M]['Custom']:
+                sysData[M]['Custom']['last_state_change'] = 0      # cycle index at last change
+            if 'phase' not in sysData[M]['Custom']:
+                sysData[M]['Custom']['phase'] = 0                  # 0 = growth, 1 = dilution
+    
+            # Pull state
+            r = float(sysData[M]['Custom']['ratio_tracker'])
+            phase = int(sysData[M]['Custom']['phase'])
+            last_change = int(sysData[M]['Custom']['last_state_change'])
+            cycle = int(sysData[M]['Experiment']['cycles'])
+            OD = float(sysData[M]['OD']['current'])
+    
+            # --- Guardrails ---
+            r = max(0.0, min(1.0, r))
+            step = max(0.0, step)
+            interval = max(1, int(interval))
+            max_input_rate = max(0.0, min(1.0, max_input_rate))
+            # If thresholds are flipped, make a safe correction
+            if od_min > od_max:
+                od_min, od_max = od_max, od_min  # swap to enforce od_min <= od_max
+    
+            # --- Fixed total input during dilution ---
+            total_input = max_input_rate
+            mediaA_rate = total_input * r            # Pump1
+            mediaB_rate = total_input * (1.0 - r)    # Pump3
+            waste_rate = total_input * output_multiplier  # Pump2 (volume management / bias)
+    
+            # --- Dwell ---
+            dwell_ok = (cycle - last_change) >= interval
+    
+            # --- State machine (two thresholds with dwell) ---
+            if phase == 0:
+                # GROWTH (inputs OFF)
+                if (OD >= od_max) and dwell_ok:
+                    # Enter dilution
+                    sysData[M]['Custom']['phase'] = 1
+                    sysData[M]['Custom']['last_state_change'] = cycle
+    
+                    # Set pump targets for dilution
+                    sysData[M]['Pump1']['target'] = mediaA_rate * sysData[M]['Pump1']['direction']
+                    sysData[M]['Pump3']['target'] = mediaB_rate * sysData[M]['Pump3']['direction']
+                    sysData[M]['Pump2']['target'] = waste_rate * sysData[M]['Pump2']['direction']
+    
+                    SetOutputOn(M, 'Pump1', 1)
+                    SetOutputOn(M, 'Pump3', 1)
+                    SetOutputOn(M, 'Pump2', 1)
+    
+                    addTerminal(M, f"C8: Entering dilution at cycle {cycle}, OD={OD:.3f}, ratio(P1)={r:.3f}")
+                else:
+                    # Stay in growth; inputs off
+                    sysData[M]['Pump1']['target'] = 0
+                    sysData[M]['Pump3']['target'] = 0
+                    sysData[M]['Pump2']['target'] = 0
+                    SetOutputOn(M, 'Pump1', 0)
+                    SetOutputOn(M, 'Pump3', 0)
+                    SetOutputOn(M, 'Pump2', 0)
+            else:
+                # DILUTION (inputs ON)
+                if (OD <= od_min) and dwell_ok:
+                    # Exit dilution -> shift ratio for next time
+                    r = min(1.0, r + step)
+                    sysData[M]['Custom']['ratio_tracker'] = r
+                    sysData[M]['Custom']['phase'] = 0
+                    sysData[M]['Custom']['last_state_change'] = cycle
+    
+                    # Turn off inputs
+                    sysData[M]['Pump1']['target'] = 0
+                    sysData[M]['Pump3']['target'] = 0
+                    sysData[M]['Pump2']['target'] = 0
+                    SetOutputOn(M, 'Pump1', 0)
+                    SetOutputOn(M, 'Pump3', 0)
+                    SetOutputOn(M, 'Pump2', 0)
+    
+                    addTerminal(M, f"C8: Exiting dilution at cycle {cycle}, OD={OD:.3f}. Next ratio(P1)={r:.3f}")
+                else:
+                    # Continue dilution with current targets
+                    sysData[M]['Pump1']['target'] = mediaA_rate * sysData[M]['Pump1']['direction']
+                    sysData[M]['Pump3']['target'] = mediaB_rate * sysData[M]['Pump3']['direction']
+                    sysData[M]['Pump2']['target'] = waste_rate * sysData[M]['Pump2']['direction']
+    
+                    SetOutputOn(M, 'Pump1', 1)
+                    SetOutputOn(M, 'Pump3', 1)
+                    SetOutputOn(M, 'Pump2', 1)
+    
+            # --- Periodic flush every odd cycle (independent of state) ---
+            if int(sysData[M]['Experiment']['cycles']) % 2 == 1:
+                flush_rate = 0.25
+                sysData[M]['Pump2']['target'] = flush_rate * sysData[M]['Pump2']['direction']
+                SetOutputOn(M, 'Pump2', 1)
+                addTerminal(M, f"C8: Flush pump triggered at cycle {sysData[M]['Experiment']['cycles']}")
+    
+            # --- Per-cycle terminal status ---
+            state_str = "dilution" if int(sysData[M]['Custom']['phase']) == 1 else "growth"
+            p1_show = sysData[M]['Pump1']['target'] if 'target' in sysData[M]['Pump1'] else 0.0
+            p3_show = sysData[M]['Pump3']['target'] if 'target' in sysData[M]['Pump3'] else 0.0
+            p2_show = sysData[M]['Pump2']['target'] if 'target' in sysData[M]['Pump2'] else 0.0
+            addTerminal(M, f"C8 status: cycle={cycle}, OD={OD:.3f}, state={state_str}, ratio(P1)={r:.3f}, "
+                           f"P1_target={p1_show:.3f}, P3_target={p3_show:.3f}, P2_target={p2_show:.3f}, "
+                           f"od_min={od_min:.3f}, od_max={od_max:.3f}")
+    
+            # Mirror phase to param2 like C7 (handy for quick UI)
+            sysData[M]['Custom']['param2'] = 1 if sysData[M]['Custom']['phase'] == 1 else 0
+    
+        except Exception as e:
+            addTerminal(M, f"C8 ERROR: {e}")
