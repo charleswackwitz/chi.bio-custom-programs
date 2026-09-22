@@ -1,0 +1,98 @@
+    elif program == "C7":
+        try:
+            with open(f'InputParameters_{M}.csv', 'r') as f:
+                reader = csv.reader(f)
+                header = next(reader)
+                values = next(reader)
+            params = dict(zip(header, values))
+    
+            ratio = float(params['media_ratio_start'])
+            step = float(params['ratio_step'])
+            output_multiplier = float(params['output_multiplier'])
+            od_threshold = float(params['od_threshold'])
+            interval = int(params.get('dilution_interval', 1))
+            max_input_rate = float(params.get('max_input_rate', 0.02))  # optional cap
+    
+            # Initialize persistent values
+            if 'ratio_tracker' not in sysData[M]['Custom']:
+                sysData[M]['Custom']['ratio_tracker'] = ratio
+            if 'dilution_counter' not in sysData[M]['Custom']:
+                sysData[M]['Custom']['dilution_counter'] = 0
+            if 'last_od' not in sysData[M]['Custom']:
+                sysData[M]['Custom']['last_od'] = 0.0
+    
+            # Read OD and compare
+            OD = sysData[M]['OD']['current']
+            last_OD = sysData[M]['Custom']['last_od']
+            sysData[M]['Custom']['last_od'] = OD
+            crossed_threshold = last_OD <= od_threshold and OD > od_threshold
+    
+            # Compute dynamic input rate from growth
+            OD_target = sysData[M]['OD']['target']
+            time_rec = sysData[M]['time']['record']
+            if OD <= 0 or OD_target <= 0 or len(time_rec) < 2:
+                total_input = 0.0
+            else:
+                try:
+                    dt = (time_rec[-1] - time_rec[-2]) / 60.0
+                    growth = math.log(OD_target / OD) / dt
+                    percent_per_min = 4 * 60 / sysData[M]['Volume']['target']
+                    total_input = max(0.0, min(-growth / percent_per_min, max_input_rate))
+                except:
+                    total_input = 0.0
+    
+            # Always compute pump ratios
+            r = sysData[M]['Custom']['ratio_tracker']
+            mediaA_rate = total_input * r
+            mediaB_rate = total_input * (1 - r)
+            waste_rate = total_input * output_multiplier
+    
+            # DEBUG output
+            addTerminal(M, f"C7 DEBUG: OD={OD:.3f}, LastOD={last_OD:.3f}, Threshold={od_threshold:.3f}")
+            addTerminal(M, f"C7 DEBUG: Media ratio A:B = {r:.2f}:{1 - r:.2f} | Input Rate={total_input:.4f}")
+    
+            if OD > od_threshold:
+                sysData[M]['Custom']['param2'] = 1
+    
+                # Count crossing events
+                if crossed_threshold:
+                    sysData[M]['Custom']['dilution_counter'] += 1
+    
+                    if sysData[M]['Custom']['dilution_counter'] % interval == 0:
+                        r = min(max(r + step, 0.0), 1.0)
+                        sysData[M]['Custom']['ratio_tracker'] = r
+                        addTerminal(M, f"C7: Media ratio updated to {r:.2f}:{1-r:.2f}")
+    
+                    addTerminal(M, f"C7: Dilution triggered at OD={OD:.3f} | Event #{sysData[M]['Custom']['dilution_counter']}")
+    
+                # Set pump targets
+                sysData[M]['Pump1']['target'] = mediaA_rate * sysData[M]['Pump1']['direction']
+                sysData[M]['Pump3']['target'] = mediaB_rate * sysData[M]['Pump3']['direction']
+                sysData[M]['Pump2']['target'] = waste_rate * sysData[M]['Pump2']['direction']
+    
+                # Turn pumps on
+                SetOutputOn(M, 'Pump1', 1)
+                SetOutputOn(M, 'Pump3', 1)
+                SetOutputOn(M, 'Pump2', 1)
+    
+                addTerminal(M, f"C7: Pumps — A: {mediaA_rate:.3f}, B: {mediaB_rate:.3f}, Waste: {waste_rate:.3f}")
+    
+            else:
+                sysData[M]['Custom']['param2'] = 0
+                sysData[M]['Pump1']['target'] = 0
+                sysData[M]['Pump3']['target'] = 0
+                sysData[M]['Pump2']['target'] = 0
+                SetOutputOn(M, 'Pump1', 0)
+                SetOutputOn(M, 'Pump3', 0)
+                SetOutputOn(M, 'Pump2', 0)
+                addTerminal(M, f"C7: No dilution — OD below threshold.")
+    
+            # Periodic flush every 2 minutes (cycle = 60s)
+            if int(sysData[M]['Experiment']['cycles']) % 2 == 1:
+                flush_rate = 0.25
+                sysData[M]['Pump2']['target'] = flush_rate * sysData[M]['Pump2']['direction']
+                SetOutputOn(M, 'Pump2', 1)
+                addTerminal(M, f"C7: Flush pump triggered at cycle {sysData[M]['Experiment']['cycles']}")
+    
+        except Exception as e:
+            addTerminal(M, f"C7 ERROR: {e}")
